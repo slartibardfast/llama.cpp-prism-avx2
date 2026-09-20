@@ -603,6 +603,38 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         sumf += d0 * sumi;
     }
 #else
+    // Plain AVX2 (Haswell .. Comet Lake, Zen 1-3: no VNNI of either width):
+    // the same unpack as the VNNI path above, with the dot expressed as
+    // maddubs(c, qy) - maddubs(1, qy); both maddubs are saturation-safe here
+    // (3 * 127 * 8 = 3048 < 32767 and 1 * 127 * 8 = 1016).
+    #if defined(__AVX2__)
+    const __m256i ones_8  = _mm256_set1_epi8(1);
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
+    const __m128i idxhi  = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
+    const __m256i mul    = _mm256_setr_epi16(64,16,4,1, 64,16,4,1, 64,16,4,1, 64,16,4,1); // <<(6-2c)
+    const __m256i three  = _mm256_set1_epi16(3);
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        float sumi = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs);
+            const __m128i src = _mm_loadl_epi64((const __m128i *) &x[i].qs[k * 8]); // 8 bytes
+            const __m256i rep = MM256_SET_M128I(_mm_shuffle_epi8(src, idxhi), _mm_shuffle_epi8(src, idxlo));
+            __m256i r0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(rep));
+            __m256i r1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(rep, 1));
+            r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
+            r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
+            __m256i codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8);
+            const __m256i dp = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(codes, qy));
+            const __m256i sy = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_8,  qy));
+            sumi += d1 * (float) hsum_i32_8(_mm256_sub_epi32(dp, sy));
+        }
+        sumf += d0 * sumi;
+    }
+    #else
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
         float sumi = 0.0f;
@@ -623,8 +655,106 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         }
         sumf += d0 * sumi;
     }
+    #endif
 #endif
 
+    *s = sumf;
+}
+
+void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_PTQ1_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ptq1_0 * GGML_RESTRICT x = vx;
+    const block_q8_0   * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+#if defined(__AVX2__)
+    // Dense-trit decode, following the reference traversal exactly (see
+    // ggml_vec_dot_ptq1_0_q8_0_generic): qs bytes 0..15 hold five 16-element
+    // groups (elements nn*16 + m, m < 16) and qs bytes 16..23 hold five
+    // 8-element groups (elements 80 + nn*8 + m, m < 8), and qh stages four
+    // 2-element groups (elements 120 + nn*2 + h, h < 2; only 4 trits per qh
+    // byte). Trit nn of byte b is ((b * 3^nn) & 0xFF) * 3 >> 8 in {0,1,2},
+    // value = that - 1. The dot per q8_0 sub-block is madd-dot(c, qy) -
+    // sum(qy), saturated-safe (2 * 127 * 8 = 2032).
+    const __m256i mask_ff   = _mm256_set1_epi16(0x00FF);
+    const __m128i mask_ff_  = _mm_set1_epi16(0x00FF);
+    const __m128i threes_   = _mm_set1_epi16(3);
+    static const short pow3v[5] = { 1, 3, 9, 27, 81 };
+    const __m256i ones_8    = _mm256_set1_epi8(1);
+    const __m256i ones_16   = _mm256_set1_epi16(1);
+    const __m128i h_mask    = _mm_setr_epi16((short) -1, (short) -1, 0, 0, 0, 0, 0, 0);
+    const __m128i h_gather  = _mm_setr_epi8(0, 1, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        // qs[0..15] -> five 16-lane groups {0,1,2}
+        const __m256i b0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *) x[i].qs));
+        __m256i t[5];
+        for (int nn = 0; nn < 5; ++nn) {
+            const __m256i v = _mm256_and_si256(_mm256_mullo_epi16(b0, _mm256_set1_epi16(pow3v[nn])), mask_ff);
+            t[nn] = _mm256_srli_epi16(_mm256_mullo_epi16(v, _mm256_set1_epi16(3)), 8);
+        }
+
+        // qs[16..23] -> five 8-lane groups
+        const __m128i b1 = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *) (x[i].qs + 16)));
+        __m128i u[5];
+        for (int nn = 0; nn < 5; ++nn) {
+            const __m128i v = _mm_and_si128(_mm_mullo_epi16(b1, _mm_set1_epi16(pow3v[nn])), mask_ff_);
+            u[nn] = _mm_srli_epi16(_mm_mullo_epi16(v, threes_), 8);
+        }
+
+        // qh: 2 bytes -> four 2-lane groups (lanes 2..7 read as zero)
+        uint32_t qh2 = 0;
+        memcpy(&qh2, x[i].qh, sizeof(x[i].qh));
+        const __m128i bh = _mm_cvtepu8_epi16(_mm_cvtsi32_si128((int) qh2));
+        __m128i h[4];
+        for (int nn = 0; nn < 4; ++nn) {
+            const __m128i v = _mm_and_si128(_mm_mullo_epi16(bh, _mm_set1_epi16(pow3v[nn])), mask_ff_);
+            h[nn] = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(v, threes_), 8), h_mask);
+        }
+
+        // the four 32-element code groups, each aligned to one q8_0 sub-block
+        const __m256i sb0 = _mm256_permute4x64_epi64(_mm256_packus_epi16(t[0], t[1]), 0xD8);
+        const __m256i sb1 = _mm256_permute4x64_epi64(_mm256_packus_epi16(t[2], t[3]), 0xD8);
+        const __m128i u01 = _mm_packus_epi16(u[0], u[1]);                                        // elements 80..95
+        const __m256i sb2 = _mm256_permute4x64_epi64(
+                _mm256_packus_epi16(t[4], _mm256_cvtepu8_epi16(u01)), 0xD8);                     // elements 64..95
+        const __m128i u23 = _mm_packus_epi16(u[2], u[3]);                                        // elements 96..111
+        const __m128i u4b = _mm_packus_epi16(u[4], u[4]);                                        // low 8 bytes: elements 112..119
+        const __m128i h01 = _mm_shuffle_epi8(_mm_packus_epi16(h[0], h[1]), h_gather);            // 4 bytes: elements 120..123
+        const __m128i h23 = _mm_shuffle_epi8(_mm_packus_epi16(h[2], h[3]), h_gather);            // 4 bytes: elements 124..127
+        const __m128i qh8 = _mm_unpacklo_epi32(h01, h23);                                        // 8 bytes: elements 120..127
+        const __m256i sb3 = MM256_SET_M128I(_mm_unpacklo_epi64(u4b, qh8), u23);                  // elements 96..127
+
+        const __m256i sb[4] = { sb0, sb1, sb2, sb3 };
+        const block_q8_0 * GGML_RESTRICT yb = &y[i * 4];
+        for (int k = 0; k < 4; ++k) {
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb[k].d);
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb[k].qs);
+            const __m256i dp = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(sb[k], qy));
+            const __m256i sy = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_8,  qy));
+            const __m256 d = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dp, sy)), _mm256_set1_ps(d0 * d1));
+            acc = _mm256_add_ps(acc, d);
+        }
+    }
+
+    sumf = hsum_float_8(acc);
+#else
+    ggml_vec_dot_ptq1_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+    return;
+#endif
     *s = sumf;
 }
 

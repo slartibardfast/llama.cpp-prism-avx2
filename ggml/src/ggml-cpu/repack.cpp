@@ -1557,6 +1557,18 @@ void ggml_gemv_pq2_0_4x8_q8_0_generic(int                        n,
     }
 }
 
+// The repacked layout is identical to PQ2_0 (ternary codes stored as 2-bit
+// slots), so the generic PQ2_0 kernels serve PTQ1_0 unchanged.
+void ggml_gemv_ptq1_0_4x8_q8_0_generic(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      const void * GGML_RESTRICT vy,
+                                      int                        nr,
+                                      int                        nc) {
+    ggml_gemv_pq2_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
 // Only enable these for RISC-V.
 #if defined __riscv_zvfh
 void ggml_gemv_q4_0_16x1_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -2827,6 +2839,16 @@ void ggml_gemm_pq2_0_4x8_q8_0_generic(int                        n,
     }
 }
 
+void ggml_gemm_ptq1_0_4x8_q8_0_generic(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      const void * GGML_RESTRICT vy,
+                                      int                        nr,
+                                      int                        nc) {
+    ggml_gemm_pq2_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
 // Only enable these for RISC-V.
 #if defined __riscv_zvfh
 void ggml_gemm_q4_0_16x1_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -3241,6 +3263,60 @@ static block_pq2_0x4 make_block_pq2_0x4(block_pq2_0 * in, unsigned int blck_size
     for (int k = 0; k < QK_PQ2_0 / 32; ++k) {
         for (int j = 0; j < 4; ++j) {
             memcpy(&out.qs[k * 32 + j * 8], &in[j].qs[k * 8], 8);
+        }
+    }
+
+    return out;
+}
+
+
+static block_ptq1_0x4 make_block_ptq1_0x4(block_ptq1_0 * in, unsigned int blck_size_interleave) {
+    block_ptq1_0x4 out;
+
+    static const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    static const size_t  stages[3] = {32, 16, 8};
+
+    GGML_ASSERT(blck_size_interleave == 8);
+
+    // Decode each dense-trit block once (the same traversal as
+    // ggml_vec_dot_ptq1_0_q8_0_generic) and store the ternary codes {0,1,2}
+    // as 2-bit slots, LSB-first, four codes per byte.
+    uint8_t codes[4][QK_PTQ1_0 / 4] = {};
+
+    for (int i = 0; i < 4; i++) {
+        out.d[i] = in[i].d;
+
+        int o = 0;
+        size_t j = 0;
+        for (size_t st = 0; st < 3; ++st) {
+            const size_t c = stages[st];
+            for (; j + c <= sizeof(in->qs); j += c) {
+                for (size_t nn = 0; nn < 5; ++nn) {
+                    for (size_t m = 0; m < c; ++m) {
+                        const uint8_t  v  = in[i].qs[j + m] * pow3[nn];
+                        const int16_t  xi = ((uint16_t) v * 3) >> 8;
+                        codes[i][o >> 2] |= (uint8_t) ((xi & 3) << (2 * (o & 3)));
+                        o++;
+                    }
+                }
+            }
+        }
+        for (size_t nn = 0; nn < 4; ++nn) {
+            for (size_t h = 0; h < sizeof(in->qh); ++h) {
+                const uint8_t  v  = in[i].qh[h] * pow3[nn];
+                const int16_t  xi = ((uint16_t) v * 3) >> 8;
+                codes[i][o >> 2] |= (uint8_t) ((xi & 3) << (2 * (o & 3)));
+                o++;
+            }
+        }
+        GGML_ASSERT(o == QK_PTQ1_0);
+    }
+
+    // Interleave rows in 8-byte chunks, one QK8_0 sub-block per row, exactly
+    // as make_block_pq2_0x4 does: qs[k*32 + j*8 + b] = row j, bytes [k*8 + b].
+    for (int k = 0; k < QK_PTQ1_0 / 32; ++k) {
+        for (int j = 0; j < 4; ++j) {
+            memcpy(&out.qs[k * 32 + j * 8], &codes[j][k * 8], 8);
         }
     }
 
@@ -4081,6 +4157,39 @@ static int repack_pq2_0_to_pq2_0_4_bl(struct ggml_tensor *       t,
     return 0;
 }
 
+static int repack_ptq1_0_to_ptq1_0_4_bl(struct ggml_tensor *       t,
+                                      int                        interleave_block,
+                                      const void * GGML_RESTRICT data,
+                                      size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_PTQ1_0);
+    GGML_ASSERT(interleave_block == 8);
+    constexpr int nrows_interleaved = 4;
+
+    block_ptq1_0x4 *     dst = (block_ptq1_0x4 *) t->data;
+    const block_ptq1_0 * src = (const block_ptq1_0 *) data;
+    block_ptq1_0         dst_tmp[4];
+    int                  nrow    = ggml_nrows(t);
+    int                  nblocks = t->ne[0] / QK_PTQ1_0;
+
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_ptq1_0));
+
+    if (t->ne[1] % nrows_interleaved != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                dst_tmp[i] = src[x + (int64_t) i * nblocks];
+            }
+            *dst++ = make_block_ptq1_0x4(dst_tmp, interleave_block);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+
+    return 0;
+}
+
 static block_q8_0x16 make_block_q8_0x16(block_q8_0 * in, unsigned int blck_size_interleave) {
     block_q8_0x16 out;
 
@@ -4518,6 +4627,10 @@ template <> int repack<block_pq2_0, 8, 4>(struct ggml_tensor * t, const void * d
     return repack_pq2_0_to_pq2_0_4_bl(t, 8, data, data_size);
 }
 
+template <> int repack<block_ptq1_0, 8, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_ptq1_0_to_ptq1_0_4_bl(t, 8, data, data_size);
+}
+
 #if defined __riscv_zvfh
 template <> int repack<block_q4_0, 1, 16>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_0_to_q4_0_16_bl(t, 1, data, data_size);
@@ -4627,6 +4740,10 @@ template <> void gemv<block_pq2_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_
     ggml_gemv_pq2_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+template <> void gemv<block_ptq1_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_ptq1_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
 #if defined __riscv_zvfh
 template <> void gemv<block_q4_0, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_q4_0_16x1_q8_0(n, s, bs, vx, vy, nr, nc);
@@ -4734,6 +4851,10 @@ template <> void gemm<block_q1_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
 
 template <> void gemm<block_pq2_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_pq2_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_ptq1_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_ptq1_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
 #if defined __riscv_zvfh
@@ -5172,6 +5293,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 
     // instance for Q2_0
     static const ggml::cpu::repack::tensor_traits<block_pq2_0, 8, 4, GGML_TYPE_Q8_0> pq2_0_4x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_ptq1_0, 8, 4, GGML_TYPE_Q8_0> ptq1_0_4x8_q8_0;
 
     // instances for RISC-V
     //
@@ -5355,6 +5477,17 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 return &pq2_0_4x8_q8_0;
             }
         }
+        if (ggml_cpu_has_avx2()) {
+            if (cur->ne[1] % 4 == 0) {
+                return &pq2_0_4x8_q8_0;
+            }
+        }
+    } else if (cur->type == GGML_TYPE_PTQ1_0) {
+        if (ggml_cpu_has_avx2()) {
+            if (cur->ne[1] % 4 == 0) {
+                return &ptq1_0_4x8_q8_0;
+            }
+        }
     }
 
     return nullptr;
@@ -5373,6 +5506,15 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
+    if (tensor_traits == nullptr) {
+        // A non-repackable tensor the runtime placed beside the weights (the
+        // prism.hadamard rotation matrices are allocated in the buffer type of
+        // the tensors they multiply): store it verbatim; every op on it stays
+        // on the generic CPU path, which reads exactly this layout.
+        memcpy(tensor->data, data, size);
+        GGML_UNUSED(buffer);
+        return;
+    }
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
@@ -5400,6 +5542,18 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     return buffer;
 }
 
+static size_t ggml_backend_cpu_repack_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+    // The 2-bit-slot repack of PTQ1_0 grows the weights by 21 percent (the
+    // 28-byte dense-trit block becomes a 34-byte 2-bit-slot block per 128
+    // weights); every other repacked type keeps its byte count.
+    size_t nbytes = ggml_nbytes(tensor);
+    if (tensor->type == GGML_TYPE_PTQ1_0) {
+        nbytes = nbytes * sizeof(block_ptq1_0x4) / (4 * sizeof(block_ptq1_0));
+    }
+    GGML_UNUSED(buft);
+    return nbytes;
+}
+
 static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return TENSOR_ALIGNMENT;
 
@@ -5409,6 +5563,26 @@ static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buf
 namespace ggml::cpu::repack {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+        // Tensors this buffer stores verbatim (no repack traits): the
+        // prism.hadamard rotation matrices and sign vectors live beside the
+        // weights they multiply. When no source of the op carries repack
+        // traits, the op never uses this buffer's kernels; the generic CPU
+        // path runs it and reads those tensors exactly as stored.
+        {
+            bool src_here = false, src_traits = false;
+            for (int i = 0; i < 4; i++) {
+                if (op->src[i] && op->src[i]->buffer &&
+                        op->src[i]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
+                    src_here = true;
+                    if (ggml_repack_get_optimal_repack_type(op->src[i])) {
+                        src_traits = true;
+                    }
+                }
+            }
+            if (src_here && !src_traits) {
+                return true;
+            }
+        }
         if (    op->op == GGML_OP_MUL_MAT &&
                 op->src[0]->buffer &&
                 (ggml_n_dims(op->src[0]) == 2) &&
@@ -5462,7 +5636,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
                            /* .alloc_buffer     = */ ggml_backend_cpu_repack_buffer_type_alloc_buffer,
                            /* .get_alignment    = */ ggml_backend_cpu_repack_buffer_type_get_alignment,
                            /* .get_max_size     = */ nullptr,  // defaults to SIZE_MAX
-                           /* .get_alloc_size   = */ nullptr,  // defaults to ggml_nbytes
+                           /* .get_alloc_size   = */ ggml_backend_cpu_repack_buffer_type_get_alloc_size,
                            /* .is_host          = */ nullptr,
                            },
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
