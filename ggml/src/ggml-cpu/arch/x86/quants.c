@@ -681,72 +681,109 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     // Dense-trit decode, following the reference traversal exactly (see
     // ggml_vec_dot_ptq1_0_q8_0_generic): qs bytes 0..15 hold five 16-element
     // groups (elements nn*16 + m, m < 16) and qs bytes 16..23 hold five
-    // 8-element groups (elements 80 + nn*8 + m, m < 8), and qh stages four
+    // 8-element groups (elements 80 + nn*8 + m, m < 8), and qh holds four
     // 2-element groups (elements 120 + nn*2 + h, h < 2; only 4 trits per qh
     // byte). Trit nn of byte b is ((b * 3^nn) & 0xFF) * 3 >> 8 in {0,1,2},
     // value = that - 1. The dot per q8_0 sub-block is madd-dot(c, qy) -
-    // sum(qy), saturated-safe (2 * 127 * 8 = 2032).
-    const __m256i mask_ff   = _mm256_set1_epi16(0x00FF);
-    const __m128i mask_ff_  = _mm_set1_epi16(0x00FF);
-    const __m128i threes_   = _mm_set1_epi16(3);
-    static const short pow3v[5] = { 1, 3, 9, 27, 81 };
-    const __m256i ones_8    = _mm256_set1_epi8(1);
-    const __m256i ones_16   = _mm256_set1_epi16(1);
-    const __m128i h_mask    = _mm_setr_epi16((short) -1, (short) -1, 0, 0, 0, 0, 0, 0);
-    const __m128i h_gather  = _mm_setr_epi8(0, 1, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    // sum(qy), saturated-safe (2 * 127 * 8 = 2032). The five decode passes
+    // are hand-unrolled with named registers: an indexed array of vectors
+    // spills to the stack in the hot loop.
+    const __m256i mask_ff = _mm256_set1_epi16(0x00FF);
+    const __m128i mask_ff_ = _mm_set1_epi16(0x00FF);
+    const __m256i threes   = _mm256_set1_epi16(3);
+    const __m128i threes_  = _mm_set1_epi16(3);
+    const __m256i ones_8   = _mm256_set1_epi8(1);
+    const __m256i ones_16  = _mm256_set1_epi16(1);
+    const __m128i h_mask   = _mm_setr_epi16((short) -1, (short) -1, 0, 0, 0, 0, 0, 0);
+    const __m128i h_gather = _mm_setr_epi8(0, 1, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
     __m256 acc = _mm256_setzero_ps();
+
+    // trit pass on 16 lanes: ((v * 3^nn) & 0xFF) * 3 >> 8, in {0,1,2}; the
+    // passes are hand-unrolled with named registers throughout
 
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
 
-        // qs[0..15] -> five 16-lane groups {0,1,2}
+        // qs[0..15]: five passes of 16 lanes; (v * 3^nn) & 0xFF first
         const __m256i b0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *) x[i].qs));
-        __m256i t[5];
-        for (int nn = 0; nn < 5; ++nn) {
-            const __m256i v = _mm256_and_si256(_mm256_mullo_epi16(b0, _mm256_set1_epi16(pow3v[nn])), mask_ff);
-            t[nn] = _mm256_srli_epi16(_mm256_mullo_epi16(v, _mm256_set1_epi16(3)), 8);
-        }
+        const __m256i s0 = _mm256_and_si256(_mm256_mullo_epi16(b0, _mm256_set1_epi16(1)),   mask_ff);
+        const __m256i s1 = _mm256_and_si256(_mm256_mullo_epi16(b0, _mm256_set1_epi16(3)),   mask_ff);
+        const __m256i s2 = _mm256_and_si256(_mm256_mullo_epi16(b0, _mm256_set1_epi16(9)),   mask_ff);
+        const __m256i s3 = _mm256_and_si256(_mm256_mullo_epi16(b0, _mm256_set1_epi16(27)),  mask_ff);
+        const __m256i s4 = _mm256_and_si256(_mm256_mullo_epi16(b0, _mm256_set1_epi16(81)),  mask_ff);
+        const __m256i t0 = _mm256_srli_epi16(_mm256_mullo_epi16(s0, threes), 8);
+        const __m256i t1 = _mm256_srli_epi16(_mm256_mullo_epi16(s1, threes), 8);
+        const __m256i t2 = _mm256_srli_epi16(_mm256_mullo_epi16(s2, threes), 8);
+        const __m256i t3 = _mm256_srli_epi16(_mm256_mullo_epi16(s3, threes), 8);
+        const __m256i t4 = _mm256_srli_epi16(_mm256_mullo_epi16(s4, threes), 8);
 
-        // qs[16..23] -> five 8-lane groups
+        // qs[16..23]: five passes of 8 lanes
         const __m128i b1 = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *) (x[i].qs + 16)));
-        __m128i u[5];
-        for (int nn = 0; nn < 5; ++nn) {
-            const __m128i v = _mm_and_si128(_mm_mullo_epi16(b1, _mm_set1_epi16(pow3v[nn])), mask_ff_);
-            u[nn] = _mm_srli_epi16(_mm_mullo_epi16(v, threes_), 8);
-        }
+        const __m128i r0 = _mm_and_si128(_mm_mullo_epi16(b1, _mm_set1_epi16(1)),  mask_ff_);
+        const __m128i r1 = _mm_and_si128(_mm_mullo_epi16(b1, _mm_set1_epi16(3)),  mask_ff_);
+        const __m128i r2 = _mm_and_si128(_mm_mullo_epi16(b1, _mm_set1_epi16(9)),  mask_ff_);
+        const __m128i r3 = _mm_and_si128(_mm_mullo_epi16(b1, _mm_set1_epi16(27)), mask_ff_);
+        const __m128i r4 = _mm_and_si128(_mm_mullo_epi16(b1, _mm_set1_epi16(81)), mask_ff_);
+        const __m128i u0 = _mm_srli_epi16(_mm_mullo_epi16(r0, threes_), 8);
+        const __m128i u1 = _mm_srli_epi16(_mm_mullo_epi16(r1, threes_), 8);
+        const __m128i u2 = _mm_srli_epi16(_mm_mullo_epi16(r2, threes_), 8);
+        const __m128i u3 = _mm_srli_epi16(_mm_mullo_epi16(r3, threes_), 8);
+        const __m128i u4 = _mm_srli_epi16(_mm_mullo_epi16(r4, threes_), 8);
 
-        // qh: 2 bytes -> four 2-lane groups (lanes 2..7 read as zero)
+        // qh: 2 bytes, four passes, lanes 2..7 masked to zero
         uint32_t qh2 = 0;
         memcpy(&qh2, x[i].qh, sizeof(x[i].qh));
         const __m128i bh = _mm_cvtepu8_epi16(_mm_cvtsi32_si128((int) qh2));
-        __m128i h[4];
-        for (int nn = 0; nn < 4; ++nn) {
-            const __m128i v = _mm_and_si128(_mm_mullo_epi16(bh, _mm_set1_epi16(pow3v[nn])), mask_ff_);
-            h[nn] = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(v, threes_), 8), h_mask);
-        }
+        const __m128i g0 = _mm_and_si128(_mm_mullo_epi16(bh, _mm_set1_epi16(1)),  mask_ff_);
+        const __m128i g1 = _mm_and_si128(_mm_mullo_epi16(bh, _mm_set1_epi16(3)),  mask_ff_);
+        const __m128i g2 = _mm_and_si128(_mm_mullo_epi16(bh, _mm_set1_epi16(9)),  mask_ff_);
+        const __m128i g3 = _mm_and_si128(_mm_mullo_epi16(bh, _mm_set1_epi16(27)), mask_ff_);
+        const __m128i h0 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(g0, threes_), 8), h_mask);
+        const __m128i h1 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(g1, threes_), 8), h_mask);
+        const __m128i h2 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(g2, threes_), 8), h_mask);
+        const __m128i h3 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(g3, threes_), 8), h_mask);
 
         // the four 32-element code groups, each aligned to one q8_0 sub-block
-        const __m256i sb0 = _mm256_permute4x64_epi64(_mm256_packus_epi16(t[0], t[1]), 0xD8);
-        const __m256i sb1 = _mm256_permute4x64_epi64(_mm256_packus_epi16(t[2], t[3]), 0xD8);
-        const __m128i u01 = _mm_packus_epi16(u[0], u[1]);                                        // elements 80..95
+        const __m256i sb0 = _mm256_permute4x64_epi64(_mm256_packus_epi16(t0, t1), 0xD8);
+        const __m256i sb1 = _mm256_permute4x64_epi64(_mm256_packus_epi16(t2, t3), 0xD8);
+        const __m128i u01 = _mm_packus_epi16(u0, u1);                                  // elements 80..95
         const __m256i sb2 = _mm256_permute4x64_epi64(
-                _mm256_packus_epi16(t[4], _mm256_cvtepu8_epi16(u01)), 0xD8);                     // elements 64..95
-        const __m128i u23 = _mm_packus_epi16(u[2], u[3]);                                        // elements 96..111
-        const __m128i u4b = _mm_packus_epi16(u[4], u[4]);                                        // low 8 bytes: elements 112..119
-        const __m128i h01 = _mm_shuffle_epi8(_mm_packus_epi16(h[0], h[1]), h_gather);            // 4 bytes: elements 120..123
-        const __m128i h23 = _mm_shuffle_epi8(_mm_packus_epi16(h[2], h[3]), h_gather);            // 4 bytes: elements 124..127
-        const __m128i qh8 = _mm_unpacklo_epi32(h01, h23);                                        // 8 bytes: elements 120..127
-        const __m256i sb3 = MM256_SET_M128I(_mm_unpacklo_epi64(u4b, qh8), u23);                  // elements 96..127
+                _mm256_packus_epi16(t4, _mm256_cvtepu8_epi16(u01)), 0xD8);             // elements 64..95
+        const __m128i u23 = _mm_packus_epi16(u2, u3);                                  // elements 96..111
+        const __m128i u4b = _mm_packus_epi16(u4, u4);                                  // low 8 bytes: elements 112..119
+        const __m128i hg0 = _mm_shuffle_epi8(_mm_packus_epi16(h0, h1), h_gather);      // elements 120..123
+        const __m128i hg1 = _mm_shuffle_epi8(_mm_packus_epi16(h2, h3), h_gather);      // elements 124..127
+        const __m128i qh8 = _mm_unpacklo_epi32(hg0, hg1);                              // elements 120..127
+        const __m256i sb3 = MM256_SET_M128I(_mm_unpacklo_epi64(u4b, qh8), u23);        // elements 96..127
 
-        const __m256i sb[4] = { sb0, sb1, sb2, sb3 };
         const block_q8_0 * GGML_RESTRICT yb = &y[i * 4];
-        for (int k = 0; k < 4; ++k) {
-            const float d1 = GGML_CPU_FP16_TO_FP32(yb[k].d);
-            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb[k].qs);
-            const __m256i dp = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(sb[k], qy));
-            const __m256i sy = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_8,  qy));
-            const __m256 d = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dp, sy)), _mm256_set1_ps(d0 * d1));
-            acc = _mm256_add_ps(acc, d);
+        {
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb[0].d);
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb[0].qs);
+            const __m256i dp = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(sb0, qy));
+            const __m256i sy = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_8, qy));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dp, sy)), _mm256_set1_ps(d0 * d1)));
+        }
+        {
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb[1].d);
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb[1].qs);
+            const __m256i dp = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(sb1, qy));
+            const __m256i sy = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_8, qy));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dp, sy)), _mm256_set1_ps(d0 * d1)));
+        }
+        {
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb[2].d);
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb[2].qs);
+            const __m256i dp = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(sb2, qy));
+            const __m256i sy = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_8, qy));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dp, sy)), _mm256_set1_ps(d0 * d1)));
+        }
+        {
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb[3].d);
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb[3].qs);
+            const __m256i dp = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(sb3, qy));
+            const __m256i sy = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_8, qy));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dp, sy)), _mm256_set1_ps(d0 * d1)));
         }
     }
 

@@ -5483,7 +5483,12 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             }
         }
     } else if (cur->type == GGML_TYPE_PTQ1_0) {
-        if (ggml_cpu_has_avx2()) {
+        // Opt-in: the repack pays the trit decode once and carries decode
+        // (13.9x the scalar baseline measured), but the batched gemm behind
+        // it still runs prefill far below the vec_dot path, so sessions that
+        // prefill long prompts keep the plan/0002 AVX2 vec_dot by default
+        // and set GGML_CPU_PTQ1_0_REPACK=1 for decode-bound use.
+        if (getenv("GGML_CPU_PTQ1_0_REPACK") != nullptr && ggml_cpu_has_avx2()) {
             if (cur->ne[1] % 4 == 0) {
                 return &ptq1_0_4x8_q8_0;
             }

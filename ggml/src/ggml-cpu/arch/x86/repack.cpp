@@ -6681,7 +6681,7 @@ static inline __m256i __pq_gather_row_avx2(const __m256i lo, const __m256i hi, c
     }
 }
 
-[[maybe_unused]] static void gemm_pq_layout_4x8_q8_0_avx2(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+static void gemm_pq_layout_4x8_q8_0_avx2(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_PQ2_0;
     const int nb = n / qk;
 
@@ -6691,38 +6691,38 @@ static inline __m256i __pq_gather_row_avx2(const __m256i lo, const __m256i hi, c
     for (int y = 0; y < nr / 4; y++) {
         const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (4 * y * nb);
 
-        for (int x = 0; x < nc / 4; x++) {
-            const block_pq2_0x4 * b_ptr = (const block_pq2_0x4 *) vx + (x * nb);
+        // one activation row at a time: four accumulators (one per weight
+        // row), the w expansion shared across j within each (l, k), and a
+        // single qword gather per (l, k, m)
+        for (int m = 0; m < 4; ++m) {
+            for (int x = 0; x < nc / 4; x++) {
+                const block_pq2_0x4 * b_ptr = (const block_pq2_0x4 *) vx + (x * nb);
 
-            __m256 acc[4][4];
-            for (int m = 0; m < 4; m++) {
+                __m256 acc[4];
                 for (int j = 0; j < 4; j++) {
-                    acc[m][j] = _mm256_setzero_ps();
+                    acc[j] = _mm256_setzero_ps();
                 }
-            }
 
-            for (int l = 0; l < nb; l++) {
-                const float d0v[4] = {
-                    GGML_CPU_FP16_TO_FP32(b_ptr[l].d[0]),
-                    GGML_CPU_FP16_TO_FP32(b_ptr[l].d[1]),
-                    GGML_CPU_FP16_TO_FP32(b_ptr[l].d[2]),
-                    GGML_CPU_FP16_TO_FP32(b_ptr[l].d[3]),
-                };
+                for (int l = 0; l < nb; l++) {
+                    const float d0v[4] = {
+                        GGML_CPU_FP16_TO_FP32(b_ptr[l].d[0]),
+                        GGML_CPU_FP16_TO_FP32(b_ptr[l].d[1]),
+                        GGML_CPU_FP16_TO_FP32(b_ptr[l].d[2]),
+                        GGML_CPU_FP16_TO_FP32(b_ptr[l].d[3]),
+                    };
 
-                for (int k = 0; k < qk / QK8_0; ++k) {
-                    const block_q8_0x4 * GGML_RESTRICT a_blk = a_ptr + 4 * l + k;
+                    for (int k = 0; k < qk / QK8_0; ++k) {
+                        const block_q8_0x4 * GGML_RESTRICT a_blk = a_ptr + 4 * l + k;
 
-                    __m256i w[4];
-                    const uint8_t * GGML_RESTRICT qs = (const uint8_t *) b_ptr[l].qs + 32 * k;
-                    for (int j = 0; j < 4; ++j) {
-                        w[j] = __pq_expand_row_avx2(qs + 8 * j);
-                    }
+                        const uint8_t * GGML_RESTRICT qs = (const uint8_t *) b_ptr[l].qs + 32 * k;
+                        __m256i w[4];
+                        for (int j = 0; j < 4; ++j) {
+                            w[j] = __pq_expand_row_avx2(qs + 8 * j);
+                        }
 
-                    // row m of the interleaved q8 activation block: qwords m, m+4, m+8, m+12
-                    const __m256i qa_lo = _mm256_loadu_si256((const __m256i *) a_blk->qs);
-                    const __m256i qa_hi = _mm256_loadu_si256((const __m256i *) (a_blk->qs + 64));
-
-                    for (int m = 0; m < 4; ++m) {
+                        // row m of the interleaved q8 block: qwords m, m+4, m+8, m+12
+                        const __m256i qa_lo = _mm256_loadu_si256((const __m256i *) a_blk->qs);
+                        const __m256i qa_hi = _mm256_loadu_si256((const __m256i *) (a_blk->qs + 64));
                         const __m256i qa = __pq_gather_row_avx2(qa_lo, qa_hi, m);
 
                         const __m256i sq = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_8, qa));
@@ -6731,15 +6731,13 @@ static inline __m256i __pq_gather_row_avx2(const __m256i lo, const __m256i hi, c
                         for (int j = 0; j < 4; ++j) {
                             const __m256i dp = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(w[j], qa));
                             const __m256  f  = _mm256_cvtepi32_ps(_mm256_sub_epi32(dp, sq));
-                            acc[m][j] = _mm256_add_ps(acc[m][j], _mm256_mul_ps(f, _mm256_set1_ps(d0v[j] * d1)));
+                            acc[j] = _mm256_add_ps(acc[j], _mm256_mul_ps(f, _mm256_set1_ps(d0v[j] * d1)));
                         }
                     }
                 }
-            }
 
-            for (int m = 0; m < 4; m++) {
                 for (int j = 0; j < 4; j++) {
-                    s[(y * 4 + m) * bs + x * 4 + j] = __pq_hsum_float_8(acc[m][j]);
+                    s[(y * 4 + m) * bs + x * 4 + j] = __pq_hsum_float_8(acc[j]);
                 }
             }
         }
@@ -6875,6 +6873,9 @@ void ggml_gemm_pq2_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
         }
         return;
     }
+#elif defined(__AVX2__)
+    gemm_pq_layout_4x8_q8_0_avx2(n, s, bs, vx, vy, nr, nc);
+    return;
 #endif // AVX512 VNNI
 
     ggml_gemm_pq2_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
@@ -6889,8 +6890,9 @@ void ggml_gemv_ptq1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
 }
 
 void ggml_gemm_ptq1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-    // The AVX2 gemv carries decode; the batched gemm stays on the generic
-    // path until an optimized one beats it (the first cut's qword gathers and
-    // 16-accumulator pressure ran prefill below the scalar baseline).
+#if defined(__AVX2__)
+    gemm_pq_layout_4x8_q8_0_avx2(n, s, bs, vx, vy, nr, nc);
+    return;
+#endif
     ggml_gemm_ptq1_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
