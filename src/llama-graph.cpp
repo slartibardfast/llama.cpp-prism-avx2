@@ -1478,7 +1478,7 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // llm_graph_context
 //
 
-llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+llm_graph_context::llm_graph_context(const llm_graph_params & params) : hadamard_fold_signs(params.hadamard_fold_signs),
     arch(params.arch),
     hparams(params.hparams),
     cparams(params.cparams),
@@ -1566,10 +1566,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
                 cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
             }
-            if (t.signs) {
-                cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+            if (t.signs && hadamard_fold_signs) {
+                cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot, t.signs);
+            } else {
+                if (t.signs) {
+                    cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+                }
+                cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
             }
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
             hadamard_memo[memo_key] = cur_mm;
             }
         }
@@ -1626,10 +1630,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
                 x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
                 cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
             }
-            if (t.signs) {
-                cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+            if (t.signs && hadamard_fold_signs) {
+                cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot, t.signs);
+            } else {
+                if (t.signs) {
+                    cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+                }
+                cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
             }
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
             hadamard_memo[memo_key] = cur_mm;
             }
         }

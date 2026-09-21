@@ -1384,7 +1384,7 @@ void llama_context::set_dspark_ctx(const float * feat, int64_t n_ctx_rows, int64
         // caller didn't supply explicit positions: assume a contiguous run
         // ending just before the current staged sequence length. this is a
         // convenience default; callers doing real multi-round decoding should
-        // pass explicit positions since the growing-cache bookkeeping (Phase 2)
+        // pass explicit positions since the growing-cache bookkeeping, second phase
         // owns the authoritative position numbering.
         std::iota(dspark_ctx.v_ctx_pos.begin(), dspark_ctx.v_ctx_pos.end(), 0);
     }
@@ -2712,6 +2712,21 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+static bool llama_hadamard_fold_signs_enabled(ggml_backend_sched_t sched) {
+    const char * env = getenv("LLAMA_HADAMARD_FOLD_SIGNS");
+    if (env && std::atoi(env) == 0) {
+        return false;
+    }
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        const char * name = ggml_backend_name(ggml_backend_sched_get_backend(sched, i));
+        if (strstr(name, "Metal") != nullptr) {
+            // the Metal fwht path does not yet read the folded sign vector
+            return false;
+        }
+    }
+    return true;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -2735,6 +2750,7 @@ llm_graph_params llama_context::graph_params(
         /*.dspark_ctx_width =*/dspark_ctx.n_embd_cap,
         /*.hadamard_rotations =*/&model.hadamard_rotations,
         /*.hadamard_inverses  =*/&model.hadamard_inverses,
+        /*/*.hadamard_fold_signs =*/llama_hadamard_fold_signs_enabled(sched.get()),
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),

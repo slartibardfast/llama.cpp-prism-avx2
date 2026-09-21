@@ -1819,8 +1819,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
-    if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
-        return;
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD) {
+        const ggml_tensor * signs_t = ggml_mul_mat_hadamard_get_signs(dst);
+        if (signs_t) {
+            if (ggml_cuda_op_fwht_signed(ctx, src1, signs_t, dst)) {
+                return;
+            }
+        } else if (ggml_cuda_op_fwht(ctx, src1, dst)) {
+            return;
+        }
+        // unsupported shape falls through to the regular matmul path
     }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.

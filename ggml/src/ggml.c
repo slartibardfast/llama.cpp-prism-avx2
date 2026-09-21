@@ -3320,6 +3320,34 @@ void ggml_mul_mat_set_prec(
     ggml_set_op_params_i32(a, 0, prec_i32);
 }
 
+void ggml_mul_mat_hadamard_set_signs(struct ggml_tensor * a, const struct ggml_tensor * signs) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+
+    union {
+        const void * p;
+        int32_t      i[2];
+    } u;
+    u.p = signs;
+
+    ggml_set_op_params_i32(a, 2, u.i[0]);
+    ggml_set_op_params_i32(a, 3, u.i[1]);
+}
+
+const struct ggml_tensor * ggml_mul_mat_hadamard_get_signs(const struct ggml_tensor * a) {
+    if (a->op != GGML_OP_MUL_MAT) {
+        return NULL;
+    }
+
+    union {
+        const void * p;
+        int32_t      i[2];
+    } u;
+    u.i[0] = ggml_get_op_params_i32(a, 2);
+    u.i[1] = ggml_get_op_params_i32(a, 3);
+
+    return (const struct ggml_tensor *) u.p;
+}
+
 void ggml_mul_mat_set_hint(
         struct ggml_tensor * a,
         enum ggml_op_hint    hint) {

@@ -3983,20 +3983,20 @@ static void ggml_compute_forward_rms_norm_back_f32(
                     // 10 scale (#00,#09)    grad[#10]
                     //
                     // backward pass, given grad[#10]
-                    // #10: scale
+                    // op: scale
                     // grad[#00] += scale(grad[#10],#09)
                     // grad[#09] += sum(mul(grad[#10],#00))
-                    // #09: div
+                    // op: div
                     // grad[#08] += neg(mul(grad[#09], div(#09,#08)))
-                    // #08: sqrt
+                    // op: sqrt
                     // grad[#07] += mul(grad[#08], div(0.5, #08))
-                    // #07: add
+                    // op: add
                     // grad[#05] += grad[#07]
-                    // #05: scale
+                    // op: scale
                     // grad[#03] += scale(grad[#05],#04)
-                    // #03: sum
+                    // op: sum
                     // grad[#02] += repeat(grad[#03], #02)
-                    // #02:
+                    // op:
                     // grad[#00] += scale(mul(#00, grad[#02]), 2.0)
                     //
                     // substitute and simplify:
@@ -11904,6 +11904,10 @@ static void ggml_compute_forward_fwht_impl(const ggml_compute_params * params, g
 
     const int64_t nr = ne11 * ne12 * ne13;
     const int64_t rows_per_thread = (nr + nth - 1) / nth;
+
+    const ggml_tensor * signs_t = ggml_mul_mat_hadamard_get_signs(dst);
+    const float * signs = signs_t ? (const float *) signs_t->data : nullptr;
+    const int64_t signs_rows = signs_t ? ggml_nelements(signs_t) / n : 1;
     const int64_t start_row = ith * rows_per_thread;
     const int64_t end_row = MIN(start_row + rows_per_thread, nr);
 
@@ -11921,8 +11925,10 @@ static void ggml_compute_forward_fwht_impl(const ggml_compute_params * params, g
         const src_t * src_row = (const src_t *) ((const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13);
         float * dst_row = (float *) ((char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
 
+        const float * signs_row = signs ? signs + (r % signs_rows) * n : nullptr;
+
         for (int64_t j = 0; j < n; j++) {
-            dst_row[j] = ggml_fwht_load(src_row[j]) * scale;
+            dst_row[j] = ggml_fwht_load(src_row[j]) * (signs_row ? signs_row[j] : 1.0f) * scale;
         }
 
         // Scalar passes
