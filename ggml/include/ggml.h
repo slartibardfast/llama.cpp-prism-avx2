@@ -1447,6 +1447,14 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
 
+    // set/get the hadamard sign vector that rides in the mul_mat hint params
+    GGML_API void ggml_mul_mat_hadamard_set_signs(
+            struct ggml_tensor * a,
+            const struct ggml_tensor * signs);
+
+    GGML_API const struct ggml_tensor * ggml_mul_mat_hadamard_get_signs(
+            const struct ggml_tensor * a);
+
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
